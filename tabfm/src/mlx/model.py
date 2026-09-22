@@ -27,6 +27,9 @@ Differences from the PyTorch version (all numerically exact):
     waste (every stage is per-position, per-row independent, or masked),
     so it is skipped. Values match the padded PyTorch path (gated by
     model_test.py's cross-backend checks).
+  - RMSNorm uses the fused mx.fast.rms_norm kernel rather than a manual
+    float32 chain. Exact in float32; in bfloat16 it is as close to the
+    float32 reference as the manual version (see RMSNorm).
   - No `.to(device)` / `.eval()` concepts (unified memory, no train mode).
   - The KV cache defaults to full precision; int8 quantization helpers are
     ported but opt-in (see ICLearningCache.quantize()).
@@ -72,14 +75,15 @@ class RMSNorm(nn.Module):
     self.eps = eps
 
   def __call__(self, x):
-    # Normalize entirely in float32 (x * rsqrt * weight), cast back at the
-    # end -- matches JAX/Flax, which keeps x*rsqrt in float32.
-    dt = x.dtype
-    xf = x.astype(mx.float32)
-    v = mx.mean(mx.square(xf), axis=-1, keepdims=True)
-    return (
-        (xf * mx.rsqrt(v + self.eps)) * self.weight.astype(mx.float32)
-    ).astype(dt)
+    # Fused kernel: it reduces in float32 internally, so float32 inputs match
+    # the JAX/Flax reference (which keeps x*rsqrt in float32) to 3e-07. In
+    # bfloat16 it rounds x*rsqrt before applying the weight, unlike the manual
+    # float32 chain, but that is immaterial: against the float32 reference on
+    # the real checkpoint the two agree to 4.5e-03 and 4.4e-03 respectively,
+    # with identical predicted classes. The norms are ~23% of inference time
+    # and this removes essentially all of it (see real_checkpoint_parity_test
+    # for the float32 gate).
+    return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 def rope_interleaved(x, base):
