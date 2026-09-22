@@ -215,6 +215,70 @@ class MlxParityTest(unittest.TestCase):
             dec_np, torch_ref[:, t_tr:, :], rtol=1e-4, atol=1e-4
         )
 
+  def test_reference_padding_is_inert(self):
+    """The 128-row padding cannot carry information into the real rows.
+
+    Licenses the MLX backend skipping it. The reference pads prefill/decode
+    to a multiple of 128 with the -100.0 sentinel; train_size counts
+    non-sentinel labels, so padded rows should be excluded everywhere. Here
+    the caller pre-pads to 128 -- once with the sentinel and once with
+    garbage feature values -- and the real-row logits must not move at all.
+    """
+    for is_classifier in [True, False]:
+      with self.subTest(is_classifier=is_classifier):
+        torch_model, _ = self._build_pair(is_classifier)
+        rng = np.random.default_rng(1234)
+        b, h, t_tr, t_te = 2, 6, 100, 20
+        pad = 128 - t_tr
+        d_np = np.array([4, 5], dtype=np.int32)
+        cat_mask_np = np.zeros((b, h), dtype=bool)
+        cat_mask_np[0, :2] = True
+        x_tr = rng.normal(size=(b, t_tr, h)).astype(np.float32)
+        x_te = rng.normal(size=(b, t_te, h)).astype(np.float32)
+        if is_classifier:
+          y_tr = rng.integers(0, CFG["max_classes"], size=(b, t_tr)).astype(
+              np.float32
+          )
+        else:
+          y_tr = rng.normal(size=(b, t_tr)).astype(np.float32)
+        y_pad = np.concatenate(
+            [y_tr, np.full((b, pad), -100.0, dtype=np.float32)], axis=1
+        )
+
+        def decode(xtr, ytr):
+          with torch.no_grad():
+            _, cache = torch_model.prefill(
+                torch.tensor(xtr),
+                torch.tensor(ytr),
+                cat_mask=torch.tensor(cat_mask_np),
+                d=torch.tensor(d_np),
+            )
+            return torch_model.decode(
+                torch.tensor(x_te),
+                cache,
+                cat_mask=torch.tensor(cat_mask_np),
+                d=torch.tensor(d_np),
+            ).numpy()
+
+        internal = decode(x_tr, y_tr)  # model pads 100 -> 128 itself
+        sentinel = decode(
+            np.concatenate(
+                [x_tr, np.full((b, pad, h), -100.0, dtype=np.float32)], axis=1
+            ),
+            y_pad,
+        )
+        garbage = decode(
+            np.concatenate(
+                [x_tr, rng.normal(size=(b, pad, h)).astype(np.float32) * 50],
+                axis=1,
+            ),
+            y_pad,
+        )
+        # Bit-identical, not merely close: padded rows are masked out, so no
+        # value placed in them may perturb the result.
+        np.testing.assert_array_equal(internal, sentinel)
+        np.testing.assert_array_equal(internal, garbage)
+
   def test_unpadded_matches_torch_at_awkward_lengths(self):
     """MLX prefill/decode (no 128-padding) matches torch (padded) forward.
 
