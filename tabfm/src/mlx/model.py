@@ -57,12 +57,15 @@ def _softplus(x):
 
 
 def get_activation(name):
-  return {"relu": lambda x: mx.maximum(x, 0),
-          "gelu": _gelu_tanh,
-          "silu": _silu}[name]
+  return {
+      "relu": lambda x: mx.maximum(x, 0),
+      "gelu": _gelu_tanh,
+      "silu": _silu,
+  }[name]
 
 
 class RMSNorm(nn.Module):
+
   def __init__(self, dim: int, eps: float = 1e-6):
     super().__init__()
     self.weight = mx.ones((dim,))
@@ -74,8 +77,9 @@ class RMSNorm(nn.Module):
     dt = x.dtype
     xf = x.astype(mx.float32)
     v = mx.mean(mx.square(xf), axis=-1, keepdims=True)
-    return ((xf * mx.rsqrt(v + self.eps)) * self.weight.astype(mx.float32)
-            ).astype(dt)
+    return (
+        (xf * mx.rsqrt(v + self.eps)) * self.weight.astype(mx.float32)
+    ).astype(dt)
 
 
 def rope_interleaved(x, base):
@@ -103,8 +107,10 @@ class RoPE(nn.Module):
 
   def rotate(self, x):  # x: [B, T, N, Dh], rotate over the T axis
     t = x.shape[1]
-    f = (mx.arange(t).astype(mx.float32)[:, None]
-         * self.freqs.astype(mx.float32)[None, :])
+    f = (
+        mx.arange(t).astype(mx.float32)[:, None]
+        * self.freqs.astype(mx.float32)[None, :]
+    )
     cos = mx.repeat(mx.cos(f), 2, axis=-1)[None, :, None, :].astype(x.dtype)
     sin = mx.repeat(mx.sin(f), 2, axis=-1)[None, :, None, :].astype(x.dtype)
     x1, x2 = x[..., 0::2], x[..., 1::2]
@@ -113,6 +119,7 @@ class RoPE(nn.Module):
 
 
 class MultiheadAttention(nn.Module):
+
   def __init__(self, d_model, nhead, rope_base=None):
     super().__init__()
     self.nhead, self.hd = nhead, d_model // nhead
@@ -125,8 +132,16 @@ class MultiheadAttention(nn.Module):
     self.key_ln = RMSNorm(self.hd)
     self.per_dim_scale = mx.zeros((self.hd,))
 
-  def __call__(self, query, key, value, attn_mask=None, rope=None,
-              cached_kv=None, return_kv=False):
+  def __call__(
+      self,
+      query,
+      key,
+      value,
+      attn_mask=None,
+      rope=None,
+      cached_kv=None,
+      return_kv=False,
+  ):
     """Computes multi-head attention, optionally with a K/V cache.
 
     At most one of cached_kv, return_kv is set. cached_kv is a (k, v) tuple of
@@ -139,30 +154,51 @@ class MultiheadAttention(nn.Module):
     q = self.q_proj(query).reshape(b, tq, self.nhead, self.hd)
 
     if cached_kv is not None:
-      assert key is None and value is None, (
-          "key/value must be None when cached_kv is provided.")
+      assert (
+          key is None and value is None
+      ), "key/value must be None when cached_kv is provided."
       cached_k, cached_v = cached_kv
       # Cached K/V may be int8-quantized; dequantize to compute dtype before use.
-      k = cached_k.dequantize(q.dtype) if isinstance(cached_k, QuantizedTensor) else cached_k
-      v = cached_v.dequantize(q.dtype) if isinstance(cached_v, QuantizedTensor) else cached_v
+      k = (
+          cached_k.dequantize(q.dtype)
+          if isinstance(cached_k, QuantizedTensor)
+          else cached_k
+      )
+      v = (
+          cached_v.dequantize(q.dtype)
+          if isinstance(cached_v, QuantizedTensor)
+          else cached_v
+      )
     else:
-      assert key is not None and value is not None, (
-          "key/value must not be None when cached_kv is absent.")
+      assert (
+          key is not None and value is not None
+      ), "key/value must not be None when cached_kv is absent."
       k = self.k_proj(key).reshape(b, key.shape[1], self.nhead, self.hd)
       v = self.v_proj(value).reshape(b, value.shape[1], self.nhead, self.hd)
 
     if self.rope_base is not None:
       # Cached K is already post-RoPE, so only rotate freshly-computed K.
-      q = rope.rotate(q) if rope is not None else rope_interleaved(q, self.rope_base)
+      q = (
+          rope.rotate(q)
+          if rope is not None
+          else rope_interleaved(q, self.rope_base)
+      )
       if cached_kv is None:
-        k = rope.rotate(k) if rope is not None else rope_interleaved(k, self.rope_base)
+        k = (
+            rope.rotate(k)
+            if rope is not None
+            else rope_interleaved(k, self.rope_base)
+        )
 
     q = self.query_ln(q)
     if cached_kv is None:
       k = self.key_ln(k)
     # per-dim scale in float32 (softplus), then cast to compute dtype -- matches JAX PerDimScale.
-    scale = (1.442695041 / math.sqrt(self.hd)
-             * _softplus(self.per_dim_scale.astype(mx.float32)))
+    scale = (
+        1.442695041
+        / math.sqrt(self.hd)
+        * _softplus(self.per_dim_scale.astype(mx.float32))
+    )
     q = q * scale.astype(q.dtype)
 
     new_k, new_v = k, v  # cache format: [B, T_src, N, D], pre-transpose.
@@ -179,7 +215,10 @@ class MultiheadAttention(nn.Module):
 
 
 class MultiheadAttentionBlock(nn.Module):
-  def __init__(self, d_model, nhead, dim_ff, activation="swiglu", rope_base=None):
+
+  def __init__(
+      self, d_model, nhead, dim_ff, activation="swiglu", rope_base=None
+  ):
     super().__init__()
     self.attn = MultiheadAttention(d_model, nhead, rope_base)
     self.pre_attn_ln = RMSNorm(d_model)
@@ -204,20 +243,36 @@ class MultiheadAttentionBlock(nn.Module):
       x = self.act(self.linear1(xn))
     return self.post_ff_ln(self.linear2(x))
 
-  def __call__(self, q, k=None, v=None, attn_mask=None, rope=None,
-              cached_kv=None, return_kv=False):
+  def __call__(
+      self,
+      q,
+      k=None,
+      v=None,
+      attn_mask=None,
+      rope=None,
+      cached_kv=None,
+      return_kv=False,
+  ):
     q_n = self.pre_attn_ln(q)
     if cached_kv is not None:
-      assert k is None and v is None, (
-          "k/v must be None when cached_kv is provided.")
+      assert (
+          k is None and v is None
+      ), "k/v must be None when cached_kv is provided."
       k_n, v_n = None, None
     else:
       k = q if k is None else k
       v = q if v is None else v
       k_n = self.pre_attn_ln(k)
       v_n = self.pre_attn_ln(v)
-    attn_res = self.attn(q_n, k_n, v_n, attn_mask, rope=rope,
-                          cached_kv=cached_kv, return_kv=return_kv)
+    attn_res = self.attn(
+        q_n,
+        k_n,
+        v_n,
+        attn_mask,
+        rope=rope,
+        cached_kv=cached_kv,
+        return_kv=return_kv,
+    )
     if return_kv:
       attn_out, new_kv = attn_res
     else:
@@ -231,13 +286,16 @@ class MultiheadAttentionBlock(nn.Module):
 
 
 class InducedSelfAttentionBlock(nn.Module):
+
   def __init__(self, d_model, nhead, dim_ff, num_inds, activation="swiglu"):
     super().__init__()
     self.ind_vectors = mx.zeros((num_inds, d_model))
     self.mab1 = MultiheadAttentionBlock(d_model, nhead, dim_ff, activation)
     self.mab2 = MultiheadAttentionBlock(d_model, nhead, dim_ff, activation)
 
-  def __call__(self, src, attn_mask=None, cached_hidden=None, return_hidden=False):
+  def __call__(
+      self, src, attn_mask=None, cached_hidden=None, return_hidden=False
+  ):
     """Applies induced self-attention, optionally reusing a cached hidden.
 
     If cached_hidden (the mab1 output from a prior call) is given, mab1 is
@@ -247,7 +305,9 @@ class InducedSelfAttentionBlock(nn.Module):
     if cached_hidden is not None:
       hidden = cached_hidden
     else:
-      ind = mx.broadcast_to(self.ind_vectors, (src.shape[0],) + self.ind_vectors.shape)
+      ind = mx.broadcast_to(
+          self.ind_vectors, (src.shape[0],) + self.ind_vectors.shape
+      )
       hidden = self.mab1(ind, src, src, attn_mask=attn_mask)
     out = self.mab2(src, hidden, hidden)
     if return_hidden:
@@ -256,11 +316,21 @@ class InducedSelfAttentionBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-  def __init__(self, num_blocks, d_model, nhead, dim_ff, activation="swiglu",
-               rope_base=100000.0):
+
+  def __init__(
+      self,
+      num_blocks,
+      d_model,
+      nhead,
+      dim_ff,
+      activation="swiglu",
+      rope_base=100000.0,
+  ):
     super().__init__()
     # One RoPE per Encoder (mirrors JAX `tf_row.rope.freqs`), shared by all blocks.
-    self.rope = RoPE(d_model // nhead, rope_base) if rope_base is not None else None
+    self.rope = (
+        RoPE(d_model // nhead, rope_base) if rope_base is not None else None
+    )
     self.blocks = [
         MultiheadAttentionBlock(d_model, nhead, dim_ff, activation, rope_base)
         for _ in range(num_blocks)
@@ -290,15 +360,19 @@ class Encoder(nn.Module):
 
 
 class SetTransformer(nn.Module):
-  def __init__(self, num_blocks, d_model, nhead, dim_ff, num_inds,
-               activation="swiglu"):
+
+  def __init__(
+      self, num_blocks, d_model, nhead, dim_ff, num_inds, activation="swiglu"
+  ):
     super().__init__()
     self.blocks = [
         InducedSelfAttentionBlock(d_model, nhead, dim_ff, num_inds, activation)
         for _ in range(num_blocks)
     ]
 
-  def __call__(self, src, attn_mask=None, cached_hidden=None, return_hidden=False):
+  def __call__(
+      self, src, attn_mask=None, cached_hidden=None, return_hidden=False
+  ):
     """Runs the stacked induced-attention blocks.
 
     cached_hidden, if given, is a per-block list of cached mab1 outputs (see
@@ -306,7 +380,9 @@ class SetTransformer(nn.Module):
     freshly computed per-block hidden reprs for later reuse.
     """
     if cached_hidden is not None:
-      assert not return_hidden, "Cannot both use cached_hidden and return_hidden."
+      assert (
+          not return_hidden
+      ), "Cannot both use cached_hidden and return_hidden."
       for blk, h in zip(self.blocks, cached_hidden):
         src = blk(src, cached_hidden=h)
       return src
@@ -322,7 +398,10 @@ class SetTransformer(nn.Module):
 
 
 class MLP(nn.Module):
-  def __init__(self, in_dim, hidden_dims: List[int], out_dim, activation="gelu"):
+
+  def __init__(
+      self, in_dim, hidden_dims: List[int], out_dim, activation="gelu"
+  ):
     super().__init__()
     self.act = get_activation(activation)
     dims = [in_dim] + list(hidden_dims)
@@ -340,6 +419,7 @@ class MLP(nn.Module):
 
 
 class OneHotAndLinear(nn.Module):
+
   def __init__(self, num_classes, embed_dim):
     super().__init__()
     self.num_classes = num_classes
@@ -350,14 +430,22 @@ class OneHotAndLinear(nn.Module):
     nc = self.num_classes
     y_mapped = mx.where((y_long >= 0) & (y_long < nc), y_long, nc)
     oh = (mx.arange(nc + 1) == y_mapped[..., None]).astype(
-        self.projection.weight.dtype)
+        self.projection.weight.dtype
+    )
     oh_sliced = oh[..., :nc]
     return self.projection(oh_sliced)
 
 
 class CellEmbedder(nn.Module):
-  def __init__(self, embed_dim, max_classes, feature_group_size=3, num_freq=32,
-               is_classifier=True):
+
+  def __init__(
+      self,
+      embed_dim,
+      max_classes,
+      feature_group_size=3,
+      num_freq=32,
+      is_classifier=True,
+  ):
     super().__init__()
     self.embed_dim = embed_dim
     self.fgs = feature_group_size
@@ -383,40 +471,51 @@ class CellEmbedder(nn.Module):
       # filled with wrapped real features rather than mixing padding into groups.
       d_safe = mx.clip(d.astype(mx.int32), 1, 2**31 - 1)  # [B]
       for i in range(self.fgs):
-        offset = (2 ** i) - 1
-        idx = (idxs[None, :] + offset) % d_safe[:, None]            # [B, H]
-        idx = mx.broadcast_to(idx[:, None, :], (x.shape[0], x.shape[1], h))  # [B,T,H]
+        offset = (2**i) - 1
+        idx = (idxs[None, :] + offset) % d_safe[:, None]  # [B, H]
+        idx = mx.broadcast_to(
+            idx[:, None, :], (x.shape[0], x.shape[1], h)
+        )  # [B,T,H]
         stacked.append(mx.take_along_axis(x, idx, axis=-1))
     else:
       for i in range(self.fgs):
-        offset = (2 ** i) - 1
+        offset = (2**i) - 1
         stacked.append(mx.take(x, (idxs + offset) % h, axis=-1))
     return mx.stack(stacked, axis=-1)
 
-  def _cell(self, x, cat_mask, d=None):  # [B,t,H] -> [B,t,HC,E] (Fourier expansion + sum over G)
-    g = mx.expand_dims(self._group(x, d=d), -1).astype(mx.float32)  # float32 Fourier
+  def _cell(
+      self, x, cat_mask, d=None
+  ):  # [B,t,H] -> [B,t,HC,E] (Fourier expansion + sum over G)
+    g = mx.expand_dims(self._group(x, d=d), -1).astype(
+        mx.float32
+    )  # float32 Fourier
     dt = x.dtype
     ff = self.fourier_frequencies.astype(mx.float32)
     ffc = self.fourier_frequencies_cat.astype(mx.float32)
     num_out = self.in_linear(
-        mx.concatenate([mx.sin(g * ff), mx.cos(g * ff)], axis=-1).astype(dt))
+        mx.concatenate([mx.sin(g * ff), mx.cos(g * ff)], axis=-1).astype(dt)
+    )
     if cat_mask is not None:
       cat_out = self.in_linear_cat(
-          mx.concatenate([mx.sin(g * ffc), mx.cos(g * ffc)], axis=-1).astype(dt))
-      cm = mx.expand_dims(self._group(
-          mx.expand_dims(cat_mask, 1).astype(mx.float32), d=d), -1).astype(mx.bool_)
+          mx.concatenate([mx.sin(g * ffc), mx.cos(g * ffc)], axis=-1).astype(dt)
+      )
+      cm = mx.expand_dims(
+          self._group(mx.expand_dims(cat_mask, 1).astype(mx.float32), d=d), -1
+      ).astype(mx.bool_)
       return mx.where(cm, cat_out, num_out).sum(-2)
     return num_out.sum(-2)
 
   def __call__(self, x, y, train_size, cat_mask=None, d=None):
     cell = self._cell(x, cat_mask, d=d)
     if self.is_classifier:
-      y_clean = mx.clip(y.astype(mx.int32), 0,
-                        self.y_embedder_lookup.weight.shape[0] - 1)
+      y_clean = mx.clip(
+          y.astype(mx.int32), 0, self.y_embedder_lookup.weight.shape[0] - 1
+      )
       y_emb = self.y_embedder_lookup(y_clean)  # [B,T,E]
     else:
       y_emb = self.y_embedder_lookup(
-          mx.expand_dims(y, -1).astype(cell.dtype))  # scalar -> [B,T,E]
+          mx.expand_dims(y, -1).astype(cell.dtype)
+      )  # scalar -> [B,T,E]
     t = x.shape[1]
     tm = (mx.arange(t)[None, :] < train_size[:, None])[..., None, None]
     out = mx.where(tm, cell + y_emb[:, :, None, :], cell)
@@ -424,12 +523,15 @@ class CellEmbedder(nn.Module):
       # Zero the padded feature columns (cols >= d): the % d wrap above fills them
       # with real features for valid indexing, but they must not enter attention.
       hc = out.shape[2]
-      colmask = (mx.arange(hc)[None, :] < d[:, None])[:, None, :, None]  # [B,1,HC,1]
+      colmask = (mx.arange(hc)[None, :] < d[:, None])[
+          :, None, :, None
+      ]  # [B,1,HC,1]
       out = mx.where(colmask, out, mx.zeros_like(out))
     return out
 
 
 class ColEmbedding(nn.Module):
+
   def __init__(self, d_model, num_blocks, nhead, dim_ff, num_inds):
     super().__init__()
     self.tf_col = SetTransformer(num_blocks, d_model, nhead, dim_ff, num_inds)
@@ -438,8 +540,12 @@ class ColEmbedding(nn.Module):
     self.col_chunk_size = None  # kept for API parity; chunking not needed in v1
 
   def _stage(self, src, mask=None, cached_hidden=None, return_hidden=False):
-    out = self.tf_col(src, attn_mask=mask, cached_hidden=cached_hidden,
-                       return_hidden=return_hidden)
+    out = self.tf_col(
+        src,
+        attn_mask=mask,
+        cached_hidden=cached_hidden,
+        return_hidden=return_hidden,
+    )
     if return_hidden:
       out, hidden = out
       return self.ln_w(self.out_w(out)), hidden
@@ -452,10 +558,12 @@ class ColEmbedding(nn.Module):
     supplies the induced-point hidden, so mab1 and its mask are skipped.
     cached_repr and return_repr are mutually exclusive.
     """
-    assert not (cached_repr is not None and return_repr), (
-        "Cannot have both cached_repr not None and return_repr True.")
-    assert (cached_repr is not None) == (train_size is None), (
-        "train_size must be None iff cached_repr is given.")
+    assert not (
+        cached_repr is not None and return_repr
+    ), "Cannot have both cached_repr not None and return_repr True."
+    assert (cached_repr is not None) == (
+        train_size is None
+    ), "train_size must be None iff cached_repr is given."
     b, t, hc, e = x.shape
     src = x.transpose(0, 2, 1, 3).reshape(b * hc, t, e)  # [B*HC, T, E]
 
@@ -476,10 +584,21 @@ class ColEmbedding(nn.Module):
 
 
 class RowInteraction(nn.Module):
-  def __init__(self, d_model, num_blocks, nhead, dim_ff, num_cls,
-               rope_base=100000.0, output_full=True):
+
+  def __init__(
+      self,
+      d_model,
+      num_blocks,
+      nhead,
+      dim_ff,
+      num_cls,
+      rope_base=100000.0,
+      output_full=True,
+  ):
     super().__init__()
-    self.tf_row = Encoder(num_blocks, d_model, nhead, dim_ff, rope_base=rope_base)
+    self.tf_row = Encoder(
+        num_blocks, d_model, nhead, dim_ff, rope_base=rope_base
+    )
     self.out_ln = RMSNorm(d_model)
     self.num_cls = num_cls
     self.output_full = output_full
@@ -518,6 +637,7 @@ class QuantizedTensor:
   [B, 1, 1, 1] so it still broadcasts against data's [B, T, N, D]; that keeps
   the merged cache int8 instead of materializing it in full precision.
   """
+
   data: mx.array
   scale: mx.array
 
@@ -537,8 +657,10 @@ _QUANTIZATION_RANGES: Dict[mx.Dtype, Tuple[int, int, int]] = {
 def _quantize_tensor(t: mx.array, dtype: mx.Dtype = mx.int8) -> QuantizedTensor:
   """Per-tensor symmetric integer quantization to dtype."""
   if dtype not in _QUANTIZATION_RANGES:
-    raise ValueError(f"Unsupported quantization dtype {dtype}; supported: "
-                     f"{list(_QUANTIZATION_RANGES.keys())}")
+    raise ValueError(
+        f"Unsupported quantization dtype {dtype}; supported: "
+        f"{list(_QUANTIZATION_RANGES.keys())}"
+    )
   lo, hi, max_val = _QUANTIZATION_RANGES[dtype]
   absmax = mx.max(mx.abs(t))
   scale = absmax / max_val
@@ -563,8 +685,10 @@ def move_cache_to_device(cache):
   if isinstance(cache, tuple):
     return tuple(move_cache_to_device(v) for v in cache)
   if dataclasses.is_dataclass(cache):
-    kwargs = {f.name: move_cache_to_device(getattr(cache, f.name))
-              for f in dataclasses.fields(cache)}
+    kwargs = {
+        f.name: move_cache_to_device(getattr(cache, f.name))
+        for f in dataclasses.fields(cache)
+    }
     return type(cache)(**kwargs)
   return cache
 
@@ -578,6 +702,7 @@ class ICLearningCache:
   of valid training rows used to build the decode attention mask; it stays
   full precision after quantize().
   """
+
   layer_caches: List[Tuple[Any, Any]]
   prefill_train_size: mx.array
 
@@ -594,17 +719,31 @@ class ICLearningCache:
     Only the attention K/V is quantized; prefill_train_size stays full
     precision.
     """
-    quantized = [(_quantize_tensor(k, dtype), _quantize_tensor(v, dtype))
-                 for k, v in self.layer_caches]
-    return ICLearningCache(layer_caches=quantized,
-                            prefill_train_size=self.prefill_train_size)
+    quantized = [
+        (_quantize_tensor(k, dtype), _quantize_tensor(v, dtype))
+        for k, v in self.layer_caches
+    ]
+    return ICLearningCache(
+        layer_caches=quantized, prefill_train_size=self.prefill_train_size
+    )
 
 
 class ICLearning(nn.Module):
-  def __init__(self, d_model, num_blocks, nhead, max_classes, dim_ff,
-               decoder_hidden, is_classifier=True):
+
+  def __init__(
+      self,
+      d_model,
+      num_blocks,
+      nhead,
+      max_classes,
+      dim_ff,
+      decoder_hidden,
+      is_classifier=True,
+  ):
     super().__init__()
-    self.tf_icl = Encoder(num_blocks, d_model, nhead, dim_ff, rope_base=None)  # ICL has no RoPE
+    self.tf_icl = Encoder(
+        num_blocks, d_model, nhead, dim_ff, rope_base=None
+    )  # ICL has no RoPE
     self.ln = RMSNorm(d_model)
     self.is_classifier = is_classifier
     if is_classifier:  # one-hot y-encode; decode to per-class logits
@@ -614,9 +753,15 @@ class ICLearning(nn.Module):
       self.y_encoder = MLP(1, [decoder_hidden], d_model)
       self.decoder = MLP(d_model, [decoder_hidden], 1)
 
-  def __call__(self, reps, y, train_size, *,
-              cache: Optional[ICLearningCache] = None,
-              return_cache: bool = False):
+  def __call__(
+      self,
+      reps,
+      y,
+      train_size,
+      *,
+      cache: Optional[ICLearningCache] = None,
+      return_cache: bool = False,
+  ):
     """Forward pass for ICLearning. reps: [B, T, E] row representations.
 
     train_size is None exactly when cache is given (decode): the attention mask
@@ -624,19 +769,22 @@ class ICLearning(nn.Module):
     rather than this call's, and y is unused. return_cache (prefill only) also
     returns the ICLearningCache for this call alongside the decoded output.
     """
-    assert (cache is not None) == (train_size is None), (
-        "train_size must be None iff cache is given.")
+    assert (cache is not None) == (
+        train_size is None
+    ), "train_size must be None iff cache is given."
     b, t, _ = reps.shape
 
     if cache is not None:  # Decode.
       prefill_seq_len = cache.prefill_seq_len
-      tm_ctx = (mx.arange(prefill_seq_len)[None, :]
-                < cache.prefill_train_size[:, None])
+      tm_ctx = (
+          mx.arange(prefill_seq_len)[None, :]
+          < cache.prefill_train_size[:, None]
+      )
       mask = tm_ctx[:, None, None, :]
       out = self.tf_icl(reps, attn_mask=mask, cached_kv=cache.layer_caches)
       return self.decoder(self.ln(out))
 
-    tm = (mx.arange(t)[None, :] < train_size[:, None])
+    tm = mx.arange(t)[None, :] < train_size[:, None]
     if self.is_classifier:
       y_enc = self.y_encoder(y)
     else:
@@ -645,35 +793,65 @@ class ICLearning(nn.Module):
     mask = tm[:, None, None, :]
     if return_cache:  # Prefill.
       out, kvs = self.tf_icl(r, attn_mask=mask, return_kv=True)
-      new_cache = ICLearningCache(layer_caches=kvs, prefill_train_size=train_size)
+      new_cache = ICLearningCache(
+          layer_caches=kvs, prefill_train_size=train_size
+      )
       return self.decoder(self.ln(out)), new_cache
     out = self.tf_icl(r, attn_mask=mask)
     return self.decoder(self.ln(out))
 
 
 class TabFM(nn.Module):
-  def __init__(self, *, embed_dim=8, max_classes=10, col_num_blocks=2,
-               col_nhead=2, col_num_inds=4, row_num_blocks=2, row_nhead=2,
-               row_num_cls=2, icl_num_blocks=2, icl_nhead=2, ff_factor=2,
-               feature_group_size=3, num_freq=32, decoder_hidden=None,
-               is_classifier=True):
+
+  def __init__(
+      self,
+      *,
+      embed_dim=8,
+      max_classes=10,
+      col_num_blocks=2,
+      col_nhead=2,
+      col_num_inds=4,
+      row_num_blocks=2,
+      row_nhead=2,
+      row_num_cls=2,
+      icl_num_blocks=2,
+      icl_nhead=2,
+      ff_factor=2,
+      feature_group_size=3,
+      num_freq=32,
+      decoder_hidden=None,
+      is_classifier=True,
+  ):
     super().__init__()
     self.max_classes = max_classes
     self.is_classifier = is_classifier
     ff = embed_dim * ff_factor
     icl_dim = embed_dim * row_num_cls
-    self.cell_embedder = CellEmbedder(embed_dim, max_classes, feature_group_size,
-                                      num_freq, is_classifier)
-    self.col_embedder = ColEmbedding(embed_dim, col_num_blocks, col_nhead, ff, col_num_inds)
-    self.col_embedder_2 = ColEmbedding(embed_dim, col_num_blocks, col_nhead, ff, col_num_inds)
-    self.row_interactor = RowInteraction(embed_dim, row_num_blocks, row_nhead, ff,
-                                         row_num_cls, output_full=True)
-    self.row_interactor_2 = RowInteraction(embed_dim, row_num_blocks, row_nhead, ff,
-                                           row_num_cls, output_full=False)
+    self.cell_embedder = CellEmbedder(
+        embed_dim, max_classes, feature_group_size, num_freq, is_classifier
+    )
+    self.col_embedder = ColEmbedding(
+        embed_dim, col_num_blocks, col_nhead, ff, col_num_inds
+    )
+    self.col_embedder_2 = ColEmbedding(
+        embed_dim, col_num_blocks, col_nhead, ff, col_num_inds
+    )
+    self.row_interactor = RowInteraction(
+        embed_dim, row_num_blocks, row_nhead, ff, row_num_cls, output_full=True
+    )
+    self.row_interactor_2 = RowInteraction(
+        embed_dim, row_num_blocks, row_nhead, ff, row_num_cls, output_full=False
+    )
     self.cls_tokens = mx.zeros((row_num_cls, embed_dim))
-    self.icl_predictor = ICLearning(icl_dim, icl_num_blocks, icl_nhead, max_classes,
-                                    icl_dim * ff_factor,
-                                    decoder_hidden or icl_dim * 2, is_classifier)
+    self.icl_predictor = ICLearning(
+        icl_dim,
+        icl_num_blocks,
+        icl_nhead,
+        max_classes,
+        icl_dim * ff_factor,
+        decoder_hidden or icl_dim * 2,
+        is_classifier,
+    )
 
   def __call__(self, x, y, train_size, cat_mask=None, d=None):
     # Mirror the JAX model's entry: replace NaN with the -100 sentinel and cast
@@ -725,7 +903,9 @@ class TabFM(nn.Module):
     emb = self.row_interactor(emb, d=d)
     emb, cache_col2 = self.col_embedder_2(emb, train_size, return_repr=True)
     reps = self.row_interactor_2(emb, d=d)
-    logits, cache_icl = self.icl_predictor(reps, y, train_size, return_cache=True)
+    logits, cache_icl = self.icl_predictor(
+        reps, y, train_size, return_cache=True
+    )
 
     cache = {"col1": cache_col1, "col2": cache_col2, "icl": cache_icl}
     return logits[:, :t_orig, :], cache

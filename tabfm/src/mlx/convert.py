@@ -31,14 +31,16 @@ import mlx.core as mx
 import numpy as np
 
 
-def convert_safetensors(safetensors_path: str, npz_path: str,
-                        dtype: mx.Dtype = mx.bfloat16) -> str:
+def convert_safetensors(
+    safetensors_path: str, npz_path: str, dtype: mx.Dtype = mx.bfloat16
+) -> str:
   """Converts safetensors -> MLX npz (optionally casting storage dtype)."""
   try:
     from safetensors import safe_open
-  except ImportError:
+  except ImportError as exc:
     raise ImportError(
-        "safetensors is required for conversion: pip install safetensors")
+        "safetensors is required for conversion: pip install safetensors"
+    ) from exc
   weights = {}
   with safe_open(safetensors_path, framework="np") as f:
     keys = list(f.keys())
@@ -50,9 +52,11 @@ def convert_safetensors(safetensors_path: str, npz_path: str,
   mx.savez(npz_path, **weights)
   mx.eval(weights)
   n_params = sum(int(np.prod(v.shape)) for v in weights.values())
-  print(f"converted {len(weights)} tensors, {n_params / 1e9:.3f}B params "
-        f"-> {npz_path} "
-        f"({os.path.getsize(npz_path) / 1e9:.2f} GB)")
+  print(
+      f"converted {len(weights)} tensors, {n_params / 1e9:.3f}B params "
+      f"-> {npz_path} "
+      f"({os.path.getsize(npz_path) / 1e9:.2f} GB)"
+  )
   return npz_path
 
 
@@ -60,13 +64,15 @@ def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("safetensors_path")
   parser.add_argument("npz_path")
-  parser.add_argument("--dtype", default="bfloat16",
-                      choices=["bfloat16", "float32"])
+  parser.add_argument(
+      "--dtype", default="bfloat16", choices=["bfloat16", "float32"]
+  )
   args = parser.parse_args(argv)
-  import numpy as np  # noqa: F401  (used in the summary line)
   convert_safetensors(
-      args.safetensors_path, args.npz_path,
-      dtype=mx.bfloat16 if args.dtype == "bfloat16" else mx.float32)
+      args.safetensors_path,
+      args.npz_path,
+      dtype=mx.bfloat16 if args.dtype == "bfloat16" else mx.float32,
+  )
 
 
 if __name__ == "__main__":

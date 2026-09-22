@@ -27,11 +27,15 @@ import unittest
 import numpy as np
 from safetensors.numpy import save_file
 
-import mlx.core as mx
-from mlx.utils import tree_flatten
+try:
+  import mlx.core as mx
+  from mlx.utils import tree_flatten
+  from tabfm.src.mlx import model as mlx_model_mod
+  from tabfm.src.mlx import tabfm_v1_0_0 as loader
 
-from tabfm.src.mlx import model as mlx_model_mod
-from tabfm.src.mlx import tabfm_v1_0_0 as loader
+  HAS_MLX = True
+except ImportError:  # MLX ships macOS/arm64 wheels only.
+  HAS_MLX = False
 
 
 CFG = dict(
@@ -54,8 +58,10 @@ def _write_checkpoint(dirname, is_classifier=True):
   """Writes a tiny model.safetensors + config.json, returns the source model."""
   model = mlx_model_mod.TabFM(is_classifier=is_classifier, **CFG)
   mx.eval(model.parameters())
-  tensors = {k: np.array(v.astype(mx.float32))
-             for k, v in tree_flatten(model.parameters())}
+  tensors = {
+      k: np.array(v.astype(mx.float32))
+      for k, v in tree_flatten(model.parameters())
+  }
   save_file(tensors, os.path.join(dirname, "model.safetensors"))
   cfg = dict(CFG)
   cfg["task"] = "classification" if is_classifier else "regression"
@@ -65,14 +71,15 @@ def _write_checkpoint(dirname, is_classifier=True):
   return model
 
 
+@unittest.skipUnless(HAS_MLX, "mlx is required (Apple silicon only)")
 class ConvertCachePathTest(unittest.TestCase):
 
   def test_path_is_keyed_on_dtype(self):
     """Two dtypes are two artifacts: loading one must not evict the other."""
-    a = loader._convert_cache_path("google/tabfm", "classification",
-                                   mx.bfloat16)
-    b = loader._convert_cache_path("google/tabfm", "classification",
-                                   mx.float32)
+    a = loader._convert_cache_path(
+        "google/tabfm", "classification", mx.bfloat16
+    )
+    b = loader._convert_cache_path("google/tabfm", "classification", mx.float32)
     c = loader._convert_cache_path("google/tabfm", "regression", mx.bfloat16)
     self.assertNotEqual(a, b)
     self.assertNotEqual(a, c)
@@ -85,6 +92,7 @@ class ConvertCachePathTest(unittest.TestCase):
     self.assertIn("float32", os.path.basename(p))
 
 
+@unittest.skipUnless(HAS_MLX, "mlx is required (Apple silicon only)")
 class LoadTest(unittest.TestCase):
 
   def setUp(self):
@@ -105,17 +113,20 @@ class LoadTest(unittest.TestCase):
     """Round-tripping through safetensors -> npz preserves the forward pass."""
     with tempfile.TemporaryDirectory() as ckpt:
       src = _write_checkpoint(ckpt)
-      loaded = loader.load(checkpoint_path=ckpt, dtype=mx.float32,
-                           use_cache=False)
+      loaded = loader.load(
+          checkpoint_path=ckpt, dtype=mx.float32, use_cache=False
+      )
       rng = np.random.default_rng(0)
       x = mx.array(rng.normal(size=(2, 6, 5)).astype(np.float32))
-      y = mx.array(rng.integers(0, CFG["max_classes"],
-                                size=(2, 6)).astype(np.float32))
+      y = mx.array(
+          rng.integers(0, CFG["max_classes"], size=(2, 6)).astype(np.float32)
+      )
       ts = mx.array(np.array([3, 4], dtype=np.int32))
       out_src, out_loaded = src(x, y, ts), loaded(x, y, ts)
       mx.eval(out_src, out_loaded)
-      np.testing.assert_allclose(np.array(out_loaded), np.array(out_src),
-                                 rtol=1e-6, atol=1e-6)
+      np.testing.assert_allclose(
+          np.array(out_loaded), np.array(out_src), rtol=1e-6, atol=1e-6
+      )
 
   def test_second_load_reuses_npz_and_dtypes_coexist(self):
     """The conversion is once per dtype, and dtypes do not evict each other."""
@@ -123,17 +134,24 @@ class LoadTest(unittest.TestCase):
       _write_checkpoint(ckpt)
       loader.load(checkpoint_path=ckpt, dtype=mx.float32, use_cache=False)
       self.assertEqual(len(self._cache_files()), 1)
-      npz = os.path.join(self._tmp.name, ".cache", "tabfm_mlx",
-                         self._cache_files()[0])
+      npz = os.path.join(
+          self._tmp.name, ".cache", "tabfm_mlx", self._cache_files()[0]
+      )
       stamp = os.stat(npz).st_mtime_ns
 
       loader.load(checkpoint_path=ckpt, dtype=mx.float32, use_cache=False)
-      self.assertEqual(os.stat(npz).st_mtime_ns, stamp,
-                       "second load re-converted instead of reusing the npz")
+      self.assertEqual(
+          os.stat(npz).st_mtime_ns,
+          stamp,
+          "second load re-converted instead of reusing the npz",
+      )
 
       loader.load(checkpoint_path=ckpt, dtype=mx.bfloat16, use_cache=False)
-      self.assertEqual(len(self._cache_files()), 2,
-                       "a second dtype must not overwrite the first")
+      self.assertEqual(
+          len(self._cache_files()),
+          2,
+          "a second dtype must not overwrite the first",
+      )
       self.assertEqual(os.stat(npz).st_mtime_ns, stamp)
 
   def test_stale_checkpoint_triggers_reconversion(self):
@@ -141,24 +159,33 @@ class LoadTest(unittest.TestCase):
     with tempfile.TemporaryDirectory() as ckpt:
       _write_checkpoint(ckpt)
       loader.load(checkpoint_path=ckpt, dtype=mx.float32, use_cache=False)
-      npz = os.path.join(self._tmp.name, ".cache", "tabfm_mlx",
-                         self._cache_files()[0])
+      npz = os.path.join(
+          self._tmp.name, ".cache", "tabfm_mlx", self._cache_files()[0]
+      )
       stamp = os.stat(npz).st_mtime_ns
       src2 = _write_checkpoint(ckpt)  # new random weights, same path
-      loaded = loader.load(checkpoint_path=ckpt, dtype=mx.float32,
-                           use_cache=False)
-      self.assertNotEqual(os.stat(npz).st_mtime_ns, stamp,
-                          "stale npz was reused after the checkpoint changed")
+      loaded = loader.load(
+          checkpoint_path=ckpt, dtype=mx.float32, use_cache=False
+      )
+      self.assertNotEqual(
+          os.stat(npz).st_mtime_ns,
+          stamp,
+          "stale npz was reused after the checkpoint changed",
+      )
       np.testing.assert_allclose(
-          np.array(loaded.cls_tokens), np.array(src2.cls_tokens),
-          rtol=1e-6, atol=1e-6)
+          np.array(loaded.cls_tokens),
+          np.array(src2.cls_tokens),
+          rtol=1e-6,
+          atol=1e-6,
+      )
 
   def test_regression_task_from_config(self):
     """task=regression in config.json selects the regression head."""
     with tempfile.TemporaryDirectory() as ckpt:
       _write_checkpoint(ckpt, is_classifier=False)
-      loaded = loader.load(checkpoint_path=ckpt, dtype=mx.float32,
-                           use_cache=False)
+      loaded = loader.load(
+          checkpoint_path=ckpt, dtype=mx.float32, use_cache=False
+      )
       self.assertFalse(loaded.is_classifier)
 
   def test_rejects_unknown_model_type(self):

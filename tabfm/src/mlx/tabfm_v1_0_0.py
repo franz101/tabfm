@@ -42,8 +42,9 @@ _LOAD_CACHE_LOCK = threading.Lock()
 _LOAD_CACHE: Dict[Any, TabFM] = {}
 
 
-def _convert_cache_path(repo_id: str, model_type: str,
-                        dtype: Optional[mx.Dtype]) -> str:
+def _convert_cache_path(
+    repo_id: str, model_type: str, dtype: Optional[mx.Dtype]
+) -> str:
   """Cache file for one (checkpoint, model_type, storage dtype) triple.
 
   dtype is part of the name: the converted npz stores the cast weights, so
@@ -58,13 +59,18 @@ def _convert_cache_path(repo_id: str, model_type: str,
   return os.path.join(cache_dir, f"{safe}__{model_type}__{dtype_tag}.npz")
 
 
-def _load_weights_cached(safetensors_path: str, npz_path: str,
-                         dtype: Optional[mx.Dtype]) -> Dict[str, mx.array]:
+def _load_weights_cached(
+    safetensors_path: str, npz_path: str, dtype: Optional[mx.Dtype]
+) -> Dict[str, mx.array]:
   """Loads weights, converting safetensors->npz once (staleness-checked)."""
   meta_path = npz_path + ".meta.json"
   st = os.stat(safetensors_path)
-  meta = {"path": safetensors_path, "size": st.st_size, "mtime": st.st_mtime,
-          "dtype": None if dtype is None else str(dtype)}
+  meta = {
+      "path": safetensors_path,
+      "size": st.st_size,
+      "mtime": st.st_mtime,
+      "dtype": None if dtype is None else str(dtype),
+  }
   use_cached = False
   if os.path.exists(npz_path) and os.path.exists(meta_path):
     try:
@@ -73,8 +79,7 @@ def _load_weights_cached(safetensors_path: str, npz_path: str,
     except (OSError, ValueError):
       use_cached = False
   if not use_cached:
-    logging.info("Converting %s to MLX weights (one-time)...",
-                 safetensors_path)
+    logging.info("Converting %s to MLX weights (one-time)...", safetensors_path)
     convert_safetensors(safetensors_path, npz_path, dtype=dtype)
     with open(meta_path, "w") as f:
       json.dump(meta, f)
@@ -82,8 +87,10 @@ def _load_weights_cached(safetensors_path: str, npz_path: str,
   if isinstance(weights, (list, tuple)):  # savez dict round-trip guard
     weights = dict(weights)
   if dtype is not None:
-    weights = {k: (v.astype(dtype) if v.dtype != dtype else v)
-               for k, v in weights.items()}
+    weights = {
+        k: v.astype(dtype) if v.dtype != dtype else v
+        for k, v in weights.items()
+    }
   return weights
 
 
@@ -156,7 +163,8 @@ def load(
         safetensors_path = os.path.join(local_dir, "model.safetensors")
       else:
         raise FileNotFoundError(
-            f"Local checkpoint path not found: {checkpoint_path}")
+            f"Local checkpoint path not found: {checkpoint_path}"
+        )
 
     cfg_path = os.path.join(local_dir, "config.json")
     model_kwargs: Dict[str, Any] = {}
@@ -166,13 +174,13 @@ def load(
     else:
       logging.warning("No config.json found in %s", local_dir)
     if "is_classifier" not in model_kwargs:
-      model_kwargs["is_classifier"] = (model_type == "classification")
+      model_kwargs["is_classifier"] = model_type == "classification"
 
     model = TabFM(**model_kwargs)
 
     npz_path = _convert_cache_path(
-        HF_REPO_ID if checkpoint_path is None else local_dir, model_type,
-        dtype)
+        HF_REPO_ID if checkpoint_path is None else local_dir, model_type, dtype
+    )
     weights = _load_weights_cached(safetensors_path, npz_path, dtype)
     model.load_weights(list(weights.items()))
     mx.eval(model.parameters())

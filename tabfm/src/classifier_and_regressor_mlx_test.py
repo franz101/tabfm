@@ -19,7 +19,12 @@ import unittest
 
 import numpy as np
 
-from tabfm.src.mlx import model as mlx_model_mod
+try:
+  from tabfm.src.mlx import model as mlx_model_mod
+
+  HAS_MLX = True
+except ImportError:  # MLX ships macOS/arm64 wheels only.
+  HAS_MLX = False
 from tabfm.src.classifier_and_regressor import TabFMClassifier, TabFMRegressor
 
 
@@ -41,13 +46,15 @@ def _small_mlx_model(is_classifier, max_classes=3):
   )
 
 
+@unittest.skipUnless(HAS_MLX, "mlx is required (Apple silicon only)")
 class MlxClassifierRegressorTest(unittest.TestCase):
 
   def test_classifier_fit_predict(self):
     np.random.seed(42)
     model = _small_mlx_model(is_classifier=True)
-    clf = TabFMClassifier(model=model, n_estimators=2, batch_size=2,
-                          random_state=42)
+    clf = TabFMClassifier(
+        model=model, n_estimators=2, batch_size=2, random_state=42
+    )
     X = np.random.rand(10, 3)
     y = np.random.randint(0, 3, size=10)
     clf.fit(X, y)
@@ -63,14 +70,19 @@ class MlxClassifierRegressorTest(unittest.TestCase):
     X = np.random.rand(10, 3)
     y = np.random.randint(0, 3, size=10)
     model = _small_mlx_model(is_classifier=True)
-    ref = TabFMClassifier(model=model,
-                          n_estimators=4, batch_size=2, random_state=42)
+    ref = TabFMClassifier(
+        model=model, n_estimators=4, batch_size=2, random_state=42
+    )
     ref.fit(X, y)
     probs = ref.predict_proba(X)
-    cached = TabFMClassifier(model=model,
-                             n_estimators=4, batch_size=2, random_state=42,
-                             cache_context=True,
-                             maybe_quantize_kv_cache=False)
+    cached = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=2,
+        random_state=42,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+    )
     cached.fit(X, y)
     probs_cached = cached.predict_proba(X)
     self.assertEqual(probs_cached.shape, probs.shape)
@@ -81,52 +93,72 @@ class MlxClassifierRegressorTest(unittest.TestCase):
     X = np.random.rand(12, 3)
     y = np.random.randint(0, 3, size=12)
     model = _small_mlx_model(is_classifier=True)
-    one = TabFMClassifier(model=model,
-                          n_estimators=4, batch_size=1, random_state=7,
-                          cache_context=True,
-                          maybe_quantize_kv_cache=False,
-                          mlx_batch_size=1)
+    one = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=1,
+        random_state=7,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+        mlx_batch_size=1,
+    )
     one.fit(X, y)
     all_at_once = TabFMClassifier(
         model=model,
-        n_estimators=4, batch_size=1, random_state=7,
-        cache_context=True, maybe_quantize_kv_cache=False,
-        mlx_batch_size=None)
+        n_estimators=4,
+        batch_size=1,
+        random_state=7,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+        mlx_batch_size=None,
+    )
     all_at_once.fit(X, y)
-    np.testing.assert_allclose(one.predict_proba(X),
-                               all_at_once.predict_proba(X),
-                               rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        one.predict_proba(X), all_at_once.predict_proba(X), rtol=1e-5, atol=1e-6
+    )
     # Uncached forward chunking must also match.
-    one_nc = TabFMClassifier(model=model,
-                             n_estimators=4, batch_size=1, random_state=7,
-                             mlx_batch_size=1)
+    one_nc = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=1,
+        random_state=7,
+        mlx_batch_size=1,
+    )
     one_nc.fit(X, y)
-    all_nc = TabFMClassifier(model=model,
-                             n_estimators=4, batch_size=1, random_state=7,
-                             mlx_batch_size=None)
+    all_nc = TabFMClassifier(
+        model=model,
+        n_estimators=4,
+        batch_size=1,
+        random_state=7,
+        mlx_batch_size=None,
+    )
     all_nc.fit(X, y)
-    np.testing.assert_allclose(one_nc.predict_proba(X),
-                               all_nc.predict_proba(X),
-                               rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        one_nc.predict_proba(X), all_nc.predict_proba(X), rtol=1e-5, atol=1e-6
+    )
 
   def test_regressor_fit_predict_cached(self):
     np.random.seed(42)
     X = np.random.rand(10, 3)
     y = np.random.rand(10) * 10
     model = _small_mlx_model(is_classifier=False)
-    reg = TabFMRegressor(model=model,
-                         n_estimators=2, batch_size=2, random_state=42)
+    reg = TabFMRegressor(
+        model=model, n_estimators=2, batch_size=2, random_state=42
+    )
     reg.fit(X, y)
     preds = reg.predict(X)
     self.assertEqual(preds.shape, (10,))
     self.assertTrue(np.all(np.isfinite(preds)))
-    cached = TabFMRegressor(model=model,
-                            n_estimators=2, batch_size=2, random_state=42,
-                            cache_context=True,
-                            maybe_quantize_kv_cache=False)
+    cached = TabFMRegressor(
+        model=model,
+        n_estimators=2,
+        batch_size=2,
+        random_state=42,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+    )
     cached.fit(X, y)
-    np.testing.assert_allclose(cached.predict(X), preds,
-                               rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(cached.predict(X), preds, rtol=1e-4, atol=1e-5)
 
 
 if __name__ == "__main__":

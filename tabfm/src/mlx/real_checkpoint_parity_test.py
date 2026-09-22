@@ -37,14 +37,19 @@ import pandas as pd
 
 try:
   import torch  # noqa: F401
+
   HAS_TORCH = True
 except ImportError:
   HAS_TORCH = False
 
-import mlx.core as mx
+try:
+  import mlx.core as mx
+  import tabfm
+  from tabfm.src.mlx import tabfm_v1_0_0 as mlx_ckpt
 
-import tabfm
-from tabfm.src.mlx import tabfm_v1_0_0 as mlx_ckpt
+  HAS_MLX = True
+except ImportError:  # MLX ships macOS/arm64 wheels only.
+  HAS_MLX = False
 
 RUN = os.environ.get("TABFM_REAL_PARITY") == "1"
 
@@ -66,71 +71,98 @@ def _dataset(seed=3):
   return X.iloc[:N_TRAIN], y[:N_TRAIN], X.iloc[N_TRAIN:]
 
 
-@unittest.skipUnless(RUN, "set TABFM_REAL_PARITY=1 (slow, needs the 6 GB checkpoint)")
+@unittest.skipUnless(HAS_MLX, "mlx is required (Apple silicon only)")
+@unittest.skipUnless(
+    RUN, "set TABFM_REAL_PARITY=1 (slow, needs the 6 GB checkpoint)"
+)
 @unittest.skipUnless(HAS_TORCH, "torch is required for the reference")
 class RealCheckpointParityTest(unittest.TestCase):
 
   @classmethod
   def setUpClass(cls):
     from tabfm.src.pytorch import tabfm_v1_0_0 as pt_ckpt
+
     cls.Xtr, cls.ytr, cls.Xte = _dataset()
     # dtype=None keeps the checkpoint's float32 storage: the reference.
-    torch_model = pt_ckpt.load(model_type="classification", device="cpu",
-                               dtype=None)
+    torch_model = pt_ckpt.load(
+        model_type="classification", device="cpu", dtype=None
+    )
     cls.ref_uncached = cls._proba(torch_model)
-    cls.ref_cached = cls._proba(torch_model, cache_context=True,
-                                maybe_quantize_kv_cache=False)
+    cls.ref_cached = cls._proba(
+        torch_model, cache_context=True, maybe_quantize_kv_cache=False
+    )
     del torch_model
     pt_ckpt._LOAD_CACHE.clear()
-    cls.mlx_model = mlx_ckpt.load(model_type="classification",
-                                  dtype=mx.float32, use_cache=False)
+    cls.mlx_model = mlx_ckpt.load(
+        model_type="classification", dtype=mx.float32, use_cache=False
+    )
 
   @classmethod
   def _proba(cls, model, **kwargs):
-    clf = tabfm.TabFMClassifier(model=model, n_estimators=2, random_state=0,
-                                **kwargs)
+    clf = tabfm.TabFMClassifier(
+        model=model, n_estimators=2, random_state=0, **kwargs
+    )
     clf.fit(cls.Xtr, cls.ytr)
     return clf.predict_proba(cls.Xte)
 
   def test_torch_cached_matches_torch_uncached(self):
     """Sanity: the reference's own two paths agree, so it can be a gold."""
-    np.testing.assert_allclose(self.ref_cached, self.ref_uncached,
-                               rtol=FP32_TOL, atol=FP32_TOL)
+    np.testing.assert_allclose(
+        self.ref_cached, self.ref_uncached, rtol=FP32_TOL, atol=FP32_TOL
+    )
 
   def test_uncached_forward_matches_torch_fp32(self):
     got = self._proba(self.mlx_model)
-    print(f"\nreal-checkpoint fp32, uncached: "
-          f"max abs diff = {np.abs(got - self.ref_uncached).max():.3e}")
-    np.testing.assert_allclose(got, self.ref_uncached,
-                               rtol=FP32_TOL, atol=FP32_TOL)
+    print(
+        "\nreal-checkpoint fp32, uncached: "
+        f"max abs diff = {np.abs(got - self.ref_uncached).max():.3e}"
+    )
+    np.testing.assert_allclose(
+        got, self.ref_uncached, rtol=FP32_TOL, atol=FP32_TOL
+    )
 
   def test_cached_decode_matches_torch_fp32(self):
     """Unpadded MLX prefill/decode vs the padded PyTorch forward."""
-    got = self._proba(self.mlx_model, cache_context=True,
-                      maybe_quantize_kv_cache=False)
-    print(f"\nreal-checkpoint fp32, cached (T={N_TRAIN}, not 128|T): "
-          f"max abs diff = {np.abs(got - self.ref_cached).max():.3e}")
-    np.testing.assert_allclose(got, self.ref_cached,
-                               rtol=FP32_TOL, atol=FP32_TOL)
+    got = self._proba(
+        self.mlx_model, cache_context=True, maybe_quantize_kv_cache=False
+    )
+    print(
+        f"\nreal-checkpoint fp32, cached (T={N_TRAIN}, not 128|T): "
+        f"max abs diff = {np.abs(got - self.ref_cached).max():.3e}"
+    )
+    np.testing.assert_allclose(
+        got, self.ref_cached, rtol=FP32_TOL, atol=FP32_TOL
+    )
 
   def test_cross_member_batching_matches_per_member(self):
     """mlx_batch_size must not change predictions on the real checkpoint."""
-    merged = self._proba(self.mlx_model, cache_context=True,
-                         maybe_quantize_kv_cache=False, mlx_batch_size=None)
-    per_member = self._proba(self.mlx_model, cache_context=True,
-                             maybe_quantize_kv_cache=False, mlx_batch_size=1)
-    np.testing.assert_allclose(merged, per_member,
-                               rtol=FP32_TOL, atol=FP32_TOL)
+    merged = self._proba(
+        self.mlx_model,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+        mlx_batch_size=None,
+    )
+    per_member = self._proba(
+        self.mlx_model,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+        mlx_batch_size=1,
+    )
+    np.testing.assert_allclose(merged, per_member, rtol=FP32_TOL, atol=FP32_TOL)
 
   def test_int8_kv_cache_stays_within_tolerance(self):
     """The quantized cache is lossy; keep the loss bounded and measured."""
-    got = self._proba(self.mlx_model, cache_context=True,
-                      maybe_quantize_kv_cache=True)
+    got = self._proba(
+        self.mlx_model, cache_context=True, maybe_quantize_kv_cache=True
+    )
     diff = float(np.abs(got - self.ref_cached).max())
-    print(f"\nreal-checkpoint fp32, cached + int8 KV: max abs diff = {diff:.3e}")
+    print(
+        f"\nreal-checkpoint fp32, cached + int8 KV: max abs diff = {diff:.3e}"
+    )
     self.assertLess(diff, INT8_TOL)
-    self.assertGreater(diff, FP32_TOL,
-                       "int8 cache appears to be a no-op; is it applied?")
+    self.assertGreater(
+        diff, FP32_TOL, "int8 cache appears to be a no-op; is it applied?"
+    )
 
 
 if __name__ == "__main__":

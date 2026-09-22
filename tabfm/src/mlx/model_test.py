@@ -31,16 +31,22 @@ import numpy as np
 try:
   import torch
   from tabfm.src.pytorch import model as torch_model_mod
+
   HAS_TORCH = True
 except ImportError:  # MLX-only environments (e.g. the timesfm-style venv).
   HAS_TORCH = False
 
-import mlx.core as mx
+try:
+  import mlx.core as mx
+  from tabfm.src.mlx import model as mlx_model_mod
 
-from tabfm.src.mlx import model as mlx_model_mod
+  HAS_MLX = True
+except ImportError:  # MLX ships macOS/arm64 wheels only.
+  HAS_MLX = False
 
 try:
   from tabfm.src.classifier_and_regressor import _concat_caches_mlx
+
   HAS_ESTIMATOR = True
 except ImportError:
   HAS_ESTIMATOR = False
@@ -64,15 +70,19 @@ CFG = dict(
 
 def _copy_torch_to_mlx(torch_model, mlx_model):
   """Copies torch params+buffers into the mirror MLX module (same key names)."""
-  weights = [(name, mx.array(p.detach().cpu().numpy()))
-             for name, p in list(torch_model.named_parameters())
-             + list(torch_model.named_buffers())]
+  weights = [
+      (name, mx.array(p.detach().cpu().numpy()))
+      for name, p in list(torch_model.named_parameters()) + list(
+          torch_model.named_buffers()
+      )
+  ]
   mlx_model.load_weights(weights)
   mx.eval(mlx_model.parameters())
   return [n for n, _ in weights]
 
 
 def _random_inputs(rng, b=3, t=5, h=8, n_classes=4, is_classifier=True):
+  """Builds a random (x, y, cat_mask, d) input tuple for the test models."""
   x_np = rng.normal(size=(b, t, h)).astype(np.float32)
   if is_classifier:
     y_np = rng.integers(0, n_classes, size=(b, t)).astype(np.float32)
@@ -87,6 +97,7 @@ def _random_inputs(rng, b=3, t=5, h=8, n_classes=4, is_classifier=True):
   return x_np, y_np, train_size_np, d_np, cat_mask_np
 
 
+@unittest.skipUnless(HAS_MLX, "mlx is required (Apple silicon only)")
 @unittest.skipUnless(HAS_TORCH, "torch is required for parity tests")
 class MlxParityTest(unittest.TestCase):
 
@@ -96,22 +107,32 @@ class MlxParityTest(unittest.TestCase):
     mlx_model = mlx_model_mod.TabFM(is_classifier=is_classifier, **CFG)
     keys = _copy_torch_to_mlx(torch_model, mlx_model)
     # Every torch leaf must land in the MLX tree (guards name drift).
-    mlx_keys = set(k for k, _ in
-                   __import__("mlx.utils", fromlist=["tree_flatten"])
-                   .tree_flatten(mlx_model.parameters()))
+    mlx_keys = set(
+        k
+        for k, _ in __import__(
+            "mlx.utils", fromlist=["tree_flatten"]
+        ).tree_flatten(mlx_model.parameters())
+    )
     self.assertEqual(set(keys), mlx_keys)
     return torch_model, mlx_model
 
   def _forward_pair(self, torch_model, mlx_model, inputs):
     x_np, y_np, train_size_np, d_np, cat_mask_np = inputs
     with torch.no_grad():
-      torch_out = torch_model(torch.from_numpy(x_np), torch.from_numpy(y_np),
-                              torch.from_numpy(train_size_np),
-                              cat_mask=torch.from_numpy(cat_mask_np),
-                              d=torch.from_numpy(d_np)).numpy()
-    mlx_out = mlx_model(mx.array(x_np), mx.array(y_np),
-                        mx.array(train_size_np),
-                        cat_mask=mx.array(cat_mask_np), d=mx.array(d_np))
+      torch_out = torch_model(
+          torch.from_numpy(x_np),
+          torch.from_numpy(y_np),
+          torch.from_numpy(train_size_np),
+          cat_mask=torch.from_numpy(cat_mask_np),
+          d=torch.from_numpy(d_np),
+      ).numpy()
+    mlx_out = mlx_model(
+        mx.array(x_np),
+        mx.array(y_np),
+        mx.array(train_size_np),
+        cat_mask=mx.array(cat_mask_np),
+        d=mx.array(d_np),
+    )
     mx.eval(mlx_out)
     return torch_out, np.array(mlx_out)
 
@@ -122,13 +143,18 @@ class MlxParityTest(unittest.TestCase):
         torch_model, mlx_model = self._build_pair(is_classifier)
         rng = np.random.default_rng(123)
         torch_out, mlx_out = self._forward_pair(
-            torch_model, mlx_model,
-            _random_inputs(rng, is_classifier=is_classifier,
-                           n_classes=CFG["max_classes"]))
+            torch_model,
+            mlx_model,
+            _random_inputs(
+                rng, is_classifier=is_classifier, n_classes=CFG["max_classes"]
+            ),
+        )
         self.assertEqual(torch_out.shape, mlx_out.shape)
         max_abs = np.max(np.abs(torch_out - mlx_out))
-        print(f"\nforward parity is_classifier={is_classifier}: "
-              f"max abs diff = {max_abs:.3e}")
+        print(
+            f"\nforward parity is_classifier={is_classifier}: "
+            f"max abs diff = {max_abs:.3e}"
+        )
         np.testing.assert_allclose(mlx_out, torch_out, rtol=1e-4, atol=1e-4)
 
   def test_prefill_decode_consistency(self):
@@ -141,8 +167,9 @@ class MlxParityTest(unittest.TestCase):
         x_tr = rng.normal(size=(b, t_tr, h)).astype(np.float32)
         x_te = rng.normal(size=(b, t_te, h)).astype(np.float32)
         if is_classifier:
-          y_tr = rng.integers(0, CFG["max_classes"],
-                              size=(b, t_tr)).astype(np.float32)
+          y_tr = rng.integers(0, CFG["max_classes"], size=(b, t_tr)).astype(
+              np.float32
+          )
         else:
           y_tr = rng.normal(size=(b, t_tr)).astype(np.float32)
         d_np = np.array([4, 5], dtype=np.int32)
@@ -152,31 +179,41 @@ class MlxParityTest(unittest.TestCase):
         # Reference: full forward on train rows + (-100-padded) test rows.
         x_full = np.concatenate([x_tr, x_te], axis=1)
         y_full = np.concatenate(
-            [y_tr, np.full((b, t_te), -100.0, dtype=np.float32)], axis=1)
+            [y_tr, np.full((b, t_te), -100.0, dtype=np.float32)], axis=1
+        )
         ts_full = np.full((b,), t_tr, dtype=np.int32)
         torch_ref, mlx_ref = self._forward_pair(
-            torch_model, mlx_model,
-            (x_full, y_full, ts_full, d_np, cat_mask_np))
+            torch_model, mlx_model, (x_full, y_full, ts_full, d_np, cat_mask_np)
+        )
         np.testing.assert_allclose(mlx_ref, torch_ref, rtol=1e-4, atol=1e-4)
 
         # MLX prefill on train, decode on test.
         logits, cache = mlx_model.prefill(
-            mx.array(x_tr), mx.array(y_tr), cat_mask=mx.array(cat_mask_np),
-            d=mx.array(d_np))
-        dec = mlx_model.decode(mx.array(x_te), cache,
-                               cat_mask=mx.array(cat_mask_np),
-                               d=mx.array(d_np))
+            mx.array(x_tr),
+            mx.array(y_tr),
+            cat_mask=mx.array(cat_mask_np),
+            d=mx.array(d_np),
+        )
+        dec = mlx_model.decode(
+            mx.array(x_te),
+            cache,
+            cat_mask=mx.array(cat_mask_np),
+            d=mx.array(d_np),
+        )
         mx.eval(logits, dec)
         dec_np = np.array(dec)
         # Decode covers test rows only: compare against the tail of forward.
         ref_tail = mlx_ref[:, t_tr:, :]
         max_abs = np.max(np.abs(dec_np - ref_tail))
-        print(f"\nprefill/decode self-consistency is_classifier={is_classifier}:"
-              f" max abs diff = {max_abs:.3e}")
+        print(
+            f"\nprefill/decode self-consistency is_classifier={is_classifier}:"
+            f" max abs diff = {max_abs:.3e}"
+        )
         np.testing.assert_allclose(dec_np, ref_tail, rtol=1e-4, atol=1e-4)
         # Cross-backend: MLX decode matches the torch full forward tail.
-        np.testing.assert_allclose(dec_np, torch_ref[:, t_tr:, :],
-                                   rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(
+            dec_np, torch_ref[:, t_tr:, :], rtol=1e-4, atol=1e-4
+        )
 
   def test_unpadded_matches_torch_at_awkward_lengths(self):
     """MLX prefill/decode (no 128-padding) matches torch (padded) forward.
@@ -198,32 +235,46 @@ class MlxParityTest(unittest.TestCase):
           x_tr = rng.normal(size=(b, t_tr, h)).astype(np.float32)
           x_te = rng.normal(size=(b, t_te, h)).astype(np.float32)
           if is_classifier:
-            y_tr = rng.integers(0, CFG["max_classes"],
-                                size=(b, t_tr)).astype(np.float32)
+            y_tr = rng.integers(0, CFG["max_classes"], size=(b, t_tr)).astype(
+                np.float32
+            )
           else:
             y_tr = rng.normal(size=(b, t_tr)).astype(np.float32)
           x_full = np.concatenate([x_tr, x_te], axis=1)
           y_full = np.concatenate(
-              [y_tr, np.full((b, t_te), -100.0, dtype=np.float32)], axis=1)
+              [y_tr, np.full((b, t_te), -100.0, dtype=np.float32)], axis=1
+          )
           ts_full = np.full((b,), t_tr, dtype=np.int32)
           torch_ref, _ = self._forward_pair(
-              torch_model, mlx_model,
-              (x_full, y_full, ts_full, d_np, cat_mask_np))
+              torch_model,
+              mlx_model,
+              (x_full, y_full, ts_full, d_np, cat_mask_np),
+          )
           logits, cache = mlx_model.prefill(
-              mx.array(x_tr), mx.array(y_tr),
-              cat_mask=mx.array(cat_mask_np), d=mx.array(d_np))
-          dec = mlx_model.decode(mx.array(x_te), cache,
-                                 cat_mask=mx.array(cat_mask_np),
-                                 d=mx.array(d_np))
+              mx.array(x_tr),
+              mx.array(y_tr),
+              cat_mask=mx.array(cat_mask_np),
+              d=mx.array(d_np),
+          )
+          dec = mlx_model.decode(
+              mx.array(x_te),
+              cache,
+              cat_mask=mx.array(cat_mask_np),
+              d=mx.array(d_np),
+          )
           mx.eval(logits, dec)
           dec_np = np.array(dec)
           max_abs = np.max(np.abs(dec_np - torch_ref[:, t_tr:, :]))
-          print(f"\nunpadded-vs-torch cls={is_classifier} "
-                f"t_tr={t_tr} t_te={t_te}: max abs diff = {max_abs:.3e}")
-          np.testing.assert_allclose(dec_np, torch_ref[:, t_tr:, :],
-                                     rtol=1e-4, atol=1e-4)
+          print(
+              f"\nunpadded-vs-torch cls={is_classifier} "
+              f"t_tr={t_tr} t_te={t_te}: max abs diff = {max_abs:.3e}"
+          )
+          np.testing.assert_allclose(
+              dec_np, torch_ref[:, t_tr:, :], rtol=1e-4, atol=1e-4
+          )
 
 
+@unittest.skipUnless(HAS_MLX, "mlx is required (Apple silicon only)")
 class MlxSelfConsistencyTest(unittest.TestCase):
   """Torch-free tests: padding edges, quantization, cache concatenation."""
 
@@ -238,8 +289,11 @@ class MlxSelfConsistencyTest(unittest.TestCase):
       rng = np.random.default_rng(11)
       b, t_tr, h = 2, 5, 6
       x_tr = rng.normal(size=(b, t_tr, h)).astype(np.float32)
-      y_tr = (rng.integers(0, CFG["max_classes"], size=(b, t_tr)).astype(np.float32)
-              if is_classifier else rng.normal(size=(b, t_tr)).astype(np.float32))
+      y_tr = (
+          rng.integers(0, CFG["max_classes"], size=(b, t_tr)).astype(np.float32)
+          if is_classifier
+          else rng.normal(size=(b, t_tr)).astype(np.float32)
+      )
       d_np = np.array([4, 5], dtype=np.int32)
       cat_mask_np = np.zeros((b, h), dtype=bool)
       for t_te in [1, 20, 128, 200]:
@@ -247,20 +301,32 @@ class MlxSelfConsistencyTest(unittest.TestCase):
           x_te = rng.normal(size=(b, t_te, h)).astype(np.float32)
           x_full = np.concatenate([x_tr, x_te], axis=1)
           y_full = np.concatenate(
-              [y_tr, np.full((b, t_te), -100.0, dtype=np.float32)], axis=1)
+              [y_tr, np.full((b, t_te), -100.0, dtype=np.float32)], axis=1
+          )
           ts_full = np.full((b,), t_tr, dtype=np.int32)
-          ref = mlx_model(mx.array(x_full), mx.array(y_full),
-                          mx.array(ts_full),
-                          cat_mask=mx.array(cat_mask_np), d=mx.array(d_np))
+          ref = mlx_model(
+              mx.array(x_full),
+              mx.array(y_full),
+              mx.array(ts_full),
+              cat_mask=mx.array(cat_mask_np),
+              d=mx.array(d_np),
+          )
           logits, cache = mlx_model.prefill(
-              mx.array(x_tr), mx.array(y_tr), cat_mask=mx.array(cat_mask_np),
-              d=mx.array(d_np))
-          dec = mlx_model.decode(mx.array(x_te), cache,
-                                 cat_mask=mx.array(cat_mask_np),
-                                 d=mx.array(d_np))
+              mx.array(x_tr),
+              mx.array(y_tr),
+              cat_mask=mx.array(cat_mask_np),
+              d=mx.array(d_np),
+          )
+          dec = mlx_model.decode(
+              mx.array(x_te),
+              cache,
+              cat_mask=mx.array(cat_mask_np),
+              d=mx.array(d_np),
+          )
           mx.eval(ref, logits, dec)
-          np.testing.assert_allclose(np.array(dec), np.array(ref)[:, t_tr:, :],
-                                     rtol=1e-4, atol=1e-4)
+          np.testing.assert_allclose(
+              np.array(dec), np.array(ref)[:, t_tr:, :], rtol=1e-4, atol=1e-4
+          )
 
   def test_quantized_decode_parity(self):
     """int8-quantized cache decode matches full-precision decode (~5e-3)."""
@@ -271,27 +337,47 @@ class MlxSelfConsistencyTest(unittest.TestCase):
         b, t_tr, t_te, h = 2, 5, 20, 6
         x_tr = rng.normal(size=(b, t_tr, h)).astype(np.float32)
         x_te = rng.normal(size=(b, t_te, h)).astype(np.float32)
-        y_tr = (rng.integers(0, CFG["max_classes"], size=(b, t_tr)).astype(np.float32)
-                if is_classifier else rng.normal(size=(b, t_tr)).astype(np.float32))
+        y_tr = (
+            rng.integers(0, CFG["max_classes"], size=(b, t_tr)).astype(
+                np.float32
+            )
+            if is_classifier
+            else rng.normal(size=(b, t_tr)).astype(np.float32)
+        )
         d_np = np.array([4, 5], dtype=np.int32)
         cat_mask_np = np.zeros((b, h), dtype=bool)
-        logits, cache = mlx_model.prefill(
-            mx.array(x_tr), mx.array(y_tr), cat_mask=mx.array(cat_mask_np),
-            d=mx.array(d_np))
-        dec = mlx_model.decode(mx.array(x_te), cache,
-                               cat_mask=mx.array(cat_mask_np),
-                               d=mx.array(d_np))
-        qcache = {"col1": cache["col1"], "col2": cache["col2"],
-                  "icl": cache["icl"].quantize()}
-        decq = mlx_model.decode(mx.array(x_te), qcache,
-                                cat_mask=mx.array(cat_mask_np),
-                                d=mx.array(d_np))
+        _, cache = mlx_model.prefill(
+            mx.array(x_tr),
+            mx.array(y_tr),
+            cat_mask=mx.array(cat_mask_np),
+            d=mx.array(d_np),
+        )
+        dec = mlx_model.decode(
+            mx.array(x_te),
+            cache,
+            cat_mask=mx.array(cat_mask_np),
+            d=mx.array(d_np),
+        )
+        qcache = {
+            "col1": cache["col1"],
+            "col2": cache["col2"],
+            "icl": cache["icl"].quantize(),
+        }
+        decq = mlx_model.decode(
+            mx.array(x_te),
+            qcache,
+            cat_mask=mx.array(cat_mask_np),
+            d=mx.array(d_np),
+        )
         mx.eval(dec, decq)
         max_abs = np.max(np.abs(np.array(decq) - np.array(dec)))
-        print(f"\nquantized decode parity is_classifier={is_classifier}: "
-              f"max abs diff = {max_abs:.3e}")
-        np.testing.assert_allclose(np.array(decq), np.array(dec),
-                                   rtol=5e-3, atol=5e-3)
+        print(
+            f"\nquantized decode parity is_classifier={is_classifier}: "
+            f"max abs diff = {max_abs:.3e}"
+        )
+        np.testing.assert_allclose(
+            np.array(decq), np.array(dec), rtol=5e-3, atol=5e-3
+        )
 
   @unittest.skipUnless(HAS_ESTIMATOR, "estimator module required")
   def test_concat_caches_equivalence(self):
@@ -300,7 +386,7 @@ class MlxSelfConsistencyTest(unittest.TestCase):
       with self.subTest(is_classifier=is_classifier):
         mlx_model = mlx_model_mod.TabFM(is_classifier=is_classifier, **CFG)
         rng = np.random.default_rng(17)
-        t_tr, t_te, h, g = 5, 7, 6, 2
+        t_tr, t_te, h = 5, 7, 6
         d_np = np.array([4, 5], dtype=np.int32)
         cat_mask_np = np.zeros((2, h), dtype=bool)
         caches, decs = [], []
@@ -308,18 +394,23 @@ class MlxSelfConsistencyTest(unittest.TestCase):
           x_tr = rng.normal(size=(1, t_tr, h)).astype(np.float32)
           x_te = rng.normal(size=(1, t_te, h)).astype(np.float32)
           if is_classifier:
-            y_tr = rng.integers(0, CFG["max_classes"],
-                                size=(1, t_tr)).astype(np.float32)
+            y_tr = rng.integers(0, CFG["max_classes"], size=(1, t_tr)).astype(
+                np.float32
+            )
           else:
             y_tr = rng.normal(size=(1, t_tr)).astype(np.float32)
-          logits, cache = mlx_model.prefill(
-              mx.array(x_tr), mx.array(y_tr),
-              cat_mask=mx.array(cat_mask_np[m:m + 1]),
-              d=mx.array(d_np[m:m + 1]))
+          _, cache = mlx_model.prefill(
+              mx.array(x_tr),
+              mx.array(y_tr),
+              cat_mask=mx.array(cat_mask_np[m : m + 1]),
+              d=mx.array(d_np[m : m + 1]),
+          )
           dec = mlx_model.decode(
-              mx.array(x_te), cache,
-              cat_mask=mx.array(cat_mask_np[m:m + 1]),
-              d=mx.array(d_np[m:m + 1]))
+              mx.array(x_te),
+              cache,
+              cat_mask=mx.array(cat_mask_np[m : m + 1]),
+              d=mx.array(d_np[m : m + 1]),
+          )
           mx.eval(dec)
           caches.append(cache)
           decs.append(np.array(dec))
@@ -329,13 +420,18 @@ class MlxSelfConsistencyTest(unittest.TestCase):
             x_te_all = np.concatenate([x_te_all, x_te], axis=0)
         big = _concat_caches_mlx(caches, mlx_model.cls_tokens.dtype)
         dec_big = mlx_model.decode(
-            mx.array(x_te_all), big, cat_mask=mx.array(cat_mask_np),
-            d=mx.array(d_np))
+            mx.array(x_te_all),
+            big,
+            cat_mask=mx.array(cat_mask_np),
+            d=mx.array(d_np),
+        )
         mx.eval(dec_big)
-        np.testing.assert_allclose(np.array(dec_big),
-                                   np.concatenate(decs, axis=0),
-                                   rtol=1e-5, atol=1e-5)
-
+        np.testing.assert_allclose(
+            np.array(dec_big),
+            np.concatenate(decs, axis=0),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
   def test_quantize_all_zero_tensor(self):
     """An all-zero K/V must quantize to a positive scale, not 0/0."""
@@ -367,19 +463,24 @@ class MlxSelfConsistencyTest(unittest.TestCase):
           x_tr = rng.normal(size=(1, t_tr, h)).astype(np.float32)
           x_te = rng.normal(size=(1, t_te, h)).astype(np.float32)
           if is_classifier:
-            y_tr = rng.integers(0, CFG["max_classes"],
-                                size=(1, t_tr)).astype(np.float32)
+            y_tr = rng.integers(0, CFG["max_classes"], size=(1, t_tr)).astype(
+                np.float32
+            )
           else:
             y_tr = rng.normal(size=(1, t_tr)).astype(np.float32)
           _, cache = mlx_model.prefill(
-              mx.array(x_tr), mx.array(y_tr),
-              cat_mask=mx.array(cat_mask_np[m:m + 1]),
-              d=mx.array(d_np[m:m + 1]))
+              mx.array(x_tr),
+              mx.array(y_tr),
+              cat_mask=mx.array(cat_mask_np[m : m + 1]),
+              d=mx.array(d_np[m : m + 1]),
+          )
           cache["icl"] = cache["icl"].quantize()
           dec = mlx_model.decode(
-              mx.array(x_te), cache,
-              cat_mask=mx.array(cat_mask_np[m:m + 1]),
-              d=mx.array(d_np[m:m + 1]))
+              mx.array(x_te),
+              cache,
+              cat_mask=mx.array(cat_mask_np[m : m + 1]),
+              d=mx.array(d_np[m : m + 1]),
+          )
           mx.eval(dec)
           caches.append(cache)
           decs.append(np.array(dec))
@@ -388,19 +489,31 @@ class MlxSelfConsistencyTest(unittest.TestCase):
         big = _concat_caches_mlx(caches, mlx_model.cls_tokens.dtype)
         for k, v in big["icl"].layer_caches:
           for t in (k, v):
-            self.assertIsInstance(t, mlx_model_mod.QuantizedTensor,
-                                  "merged cache must stay quantized")
+            self.assertIsInstance(
+                t,
+                mlx_model_mod.QuantizedTensor,
+                "merged cache must stay quantized",
+            )
             self.assertEqual(t.data.dtype, mx.int8)
-            self.assertEqual(t.scale.shape, (2, 1, 1, 1),
-                             "one scale per member is what makes the merge "
-                             "exact without dequantizing")
+            self.assertEqual(
+                t.scale.shape,
+                (2, 1, 1, 1),
+                "one scale per member is what makes the merge "
+                "exact without dequantizing",
+            )
         dec_big = mlx_model.decode(
-            mx.array(np.concatenate(x_tes, axis=0)), big,
-            cat_mask=mx.array(cat_mask_np), d=mx.array(d_np))
+            mx.array(np.concatenate(x_tes, axis=0)),
+            big,
+            cat_mask=mx.array(cat_mask_np),
+            d=mx.array(d_np),
+        )
         mx.eval(dec_big)
-        np.testing.assert_allclose(np.array(dec_big),
-                                   np.concatenate(decs, axis=0),
-                                   rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            np.array(dec_big),
+            np.concatenate(decs, axis=0),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
 
 if __name__ == "__main__":
