@@ -192,6 +192,11 @@ class LoadTest(unittest.TestCase):
     with self.assertRaises(ValueError):
       loader.load(model_type="clustering")
 
+  def test_float16_is_rejected(self):
+    """float16 silently produced NaN before this guard."""
+    with self.assertRaisesRegex(ValueError, "float16 overflows"):
+      loader.load(dtype=mx.float16)
+
 
 if __name__ == "__main__":
   unittest.main()

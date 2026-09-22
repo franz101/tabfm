@@ -120,7 +120,9 @@ def load(
     checkpoint_path: Local directory or weights file. If None, downloads from
       Hugging Face (google/tabfm-1.0.0-pytorch).
     dtype: Compute dtype to cast the model to after loading. Defaults to
-      bfloat16; pass None to keep the float32 weights.
+      bfloat16; pass None to keep the float32 weights (~1.2x slower, and the
+      reference the bfloat16 path approximates). float16 is rejected: its
+      65504 range overflows to NaN here.
     use_cache: Reuse a process-wide cached model for identical settings.
 
   Returns:
@@ -130,6 +132,13 @@ def load(
     raise ValueError(
         f"Unsupported model_type: {model_type!r}. "
         "Must be 'classification' or 'regression'."
+    )
+
+  if dtype is mx.float16:
+    raise ValueError(
+        "float16 overflows this model: activations exceed its 65504 range and "
+        "the forward pass returns NaN. Use bfloat16 (the design dtype, same "
+        "speed) or None for float32."
     )
 
   cache_key = (model_type, checkpoint_path, str(dtype))
